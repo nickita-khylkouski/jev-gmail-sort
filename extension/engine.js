@@ -334,8 +334,167 @@ function bradleyTerry(ids, matches, seed) {
   }
   return new Map(ids.map((id) => [id, Math.log(s.get(id))]));
 }
+function rankLive(task, emit) {
+  const AT_ONCE = 2;
+  const t0 = performance.now();
+  Object.assign(stats, { calls: 0, decisions: 0, errors: 0, hedges: 0, inputTokens: 0, lat: [] });
+  const ids = [];
+  const cards = new Map;
+  const played = new Map;
+  const record = new Map;
+  const games = new Map;
+  const busy = new Map;
+  const isBusy = (id) => (busy.get(id) || 0) >= AT_ONCE;
+  const matches = [];
+  const noSeed = new Map;
+  const rule = `Rank each ${task.noun} by this criterion: "${task.criterion}".`;
+  const base = { context: task.context, criterion: task.criterion };
+  let strength = new Map;
+  let out = 0, fitAt = 0, dirty = false, ended = false, stopped = false, finished = false, settled = false;
+  let resolveDone = () => {};
+  const done = new Promise((r) => resolveDone = r);
+  const target = () => Math.ceil(Math.log2(Math.max(2, ids.length))) + 2;
+  const budget = () => Math.ceil(ids.length * target() / 2) + 5;
+  const refit = (force = false) => {
+    if (!dirty && !force)
+      return;
+    if (!force && performance.now() - fitAt < 60)
+      return;
+    strength = bradleyTerry(ids, matches, noSeed);
+    fitAt = performance.now();
+    dirty = false;
+  };
+  const order = () => [...ids].sort((x, y) => (strength.get(y) ?? 0) - (strength.get(x) ?? 0));
+  const standings = () => emit({ type: "standings", order: order(), record: Object.fromEntries(record), budget: budget() });
+  const play = async (a, b, phase) => {
+    out++;
+    for (const x2 of [a, b])
+      busy.set(x2, (busy.get(x2) || 0) + 1);
+    played.get(a).add(b);
+    played.get(b).add(a);
+    const swap = Math.random() < 0.5;
+    const [x, y] = swap ? [b, a] : [a, b];
+    try {
+      const r = await jev({ ...base, A: cards.get(x), B: cards.get(y) }, {
+        higher: {
+          type: "choice",
+          instructions: [rule, `Which ${task.noun}, \`A\` or \`B\`, ranks higher?`, ...task.guide || []],
+          criteria: { A: `${task.noun} A ranks higher`, B: `${task.noun} B ranks higher` }
+        }
+      });
+      const pX = r.answers.higher.probabilities.A ?? (r.answers.higher.choice === "A" ? 1 : 0);
+      const m = { a, b, pA: swap ? 1 - pX : pX, ms: Math.round(r.ms), phase };
+      matches.push(m);
+      games.set(a, games.get(a) + 1);
+      games.set(b, games.get(b) + 1);
+      record.get(m.pA >= 0.5 ? a : b).w++;
+      record.get(m.pA >= 0.5 ? b : a).l++;
+      dirty = true;
+      emit({ type: "match", ...m });
+    } catch (e) {
+      emit({ type: "error", id: a, message: String(e).slice(0, 160) });
+    } finally {
+      for (const x2 of [a, b])
+        busy.set(x2, busy.get(x2) - 1);
+      out--;
+      pump();
+    }
+  };
+  function pump() {
+    if (stopped || finished)
+      return;
+    refit();
+    const T = target();
+    const free = ids.filter((id) => !isBusy(id));
+    const load = (id) => games.get(id) + (busy.get(id) || 0);
+    const need = shuffle(free.filter((id) => load(id) < T)).sort((x, y) => load(x) - load(y));
+    for (const a of need) {
+      while (!isBusy(a) && load(a) < T) {
+        const sa = strength.get(a) ?? 0, ga = load(a);
+        let best = "", bestV = -1;
+        for (const b of free) {
+          if (b === a || isBusy(b) || played.get(a).has(b))
+            continue;
+          const p = 1 / (1 + Math.exp((strength.get(b) ?? 0) - sa));
+          const v = p * (1 - p) * (1 / (ga + 1) + 1 / (load(b) + 1));
+          if (v > bestV)
+            bestV = v, best = b;
+        }
+        if (!best)
+          break;
+        play(a, best, "live");
+      }
+    }
+    if (!ended)
+      return;
+    if (!settled && ids.every((id) => games.get(id) >= T || ids.every((b) => b === id || played.get(id).has(b)))) {
+      settled = true;
+      refit(true);
+      const top = order().slice(0, 6);
+      for (let i = 0;i + 1 < top.length; i++) {
+        const [a, b] = [top[i], top[i + 1]];
+        if (!isBusy(a) && !isBusy(b) && !played.get(a).has(b))
+          play(a, b, "top");
+      }
+    }
+    if (out === 0)
+      finish();
+  }
+  const live = setInterval(() => {
+    if (!dirty)
+      return;
+    refit(true);
+    standings();
+  }, 250);
+  function finish() {
+    finished = true;
+    clearInterval(live);
+    refit(true);
+    const final = order();
+    const vals = [...strength.values()];
+    const max = Math.max(...vals), min = Math.min(...vals);
+    const result = {
+      type: "done",
+      algo: "live",
+      order: final,
+      importance: Object.fromEntries(final.map((id) => [id, ((strength.get(id) ?? 0) - min) / (max - min || 1)])),
+      record: Object.fromEntries(record),
+      matches: matches.length,
+      ms: Math.round(performance.now() - t0),
+      jev: summary()
+    };
+    emit(result);
+    resolveDone(result);
+  }
+  return {
+    add(item) {
+      if (cards.has(item.id) || ended)
+        return;
+      ids.push(item.id);
+      cards.set(item.id, item.card);
+      played.set(item.id, new Set);
+      record.set(item.id, { w: 0, l: 0 });
+      games.set(item.id, 0);
+      dirty = true;
+      pump();
+    },
+    end() {
+      ended = true;
+      if (ids.length < 2)
+        finish();
+      else
+        pump();
+      return done;
+    },
+    stop() {
+      stopped = true;
+      clearInterval(live);
+    }
+  };
+}
 export {
   summary,
+  rankLive,
   rank,
   jev,
   configure,

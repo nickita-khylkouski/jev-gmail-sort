@@ -1,7 +1,8 @@
 // Headless test of the "sort this page" side panel on the demo pages. The panel is opened as a tab
 // pointed at the page's tab (headless Chrome has no side panel UI); everything else is real: the page
-// text, Luna's extraction and Jev's Swiss rounds.
-//   bun run test/panel.ts [yc|linkedin|all] ["sentence"] [--headed]
+// text, the extraction model and the live ranking. --ahead waits for the read-ahead before pressing
+// Sort (the usual case: the panel is open before you've typed); without it, Sort is pressed at once.
+//   bun run test/panel.ts [yc|linkedin|hn|all] ["sentence"] [--ahead] [--headed]
 import { chromium } from "playwright";
 
 const which = process.argv[2] && !process.argv[2].startsWith("--") ? process.argv[2] : "all";
@@ -15,12 +16,13 @@ const extId = new URL(sw.url()).host;
 const li = await Bun.file("data/linkedin.txt").text().catch(() => "");
 const esc = (s: string) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]!);
 await ctx.route("https://www.linkedin.com/in/**", (r) =>
-  r.fulfill({ contentType: "text/html", body: `<!doctype html><title>Profile | LinkedIn</title><body style="font:14px system-ui;max-width:760px;margin:24px auto">${li.split("\n").map((l) => `<p>${esc(l)}</p>`).join("")}</body>` }),
+  r.fulfill({ contentType: "text/html; charset=utf-8", body: `<!doctype html><title>Profile | LinkedIn</title><body style="font:14px system-ui;max-width:760px;margin:24px auto">${li.split("\n").map((l) => `<p>${esc(l)}</p>`).join("")}</body>` }),
 );
 
 const DEMOS = {
   yc: { url: "https://www.ycombinator.com/security", q: "how big the vulnerability was" },
   linkedin: { url: "https://www.linkedin.com/in/demo-profile/", q: "most impressive achievement, on merit" },
+  hn: { url: "https://news.ycombinator.com/item?id=50045984", q: "most useful" },
 };
 for (const [name, d] of Object.entries(DEMOS)) {
   if (which !== "all" && which !== name) continue;
@@ -32,6 +34,7 @@ for (const [name, d] of Object.entries(DEMOS)) {
   await panel.setViewportSize({ width: 400, height: 900 });
   await panel.goto(`chrome-extension://${extId}/panel.html?tab=${tabId}`);
   await panel.fill("#q", custom || d.q);
+  if (process.argv.includes("--ahead")) await panel.waitForTimeout(12000);
   const t0 = Date.now();
   await panel.press("#q", "Enter");
   let first = 0, seen = 0;

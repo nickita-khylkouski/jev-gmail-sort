@@ -1,17 +1,19 @@
-// Sort any page by a sentence. The side panel reads the page's text, Luna (OpenAI) picks out just the
-// items worth ranking (streamed in one by one), then Jev ranks them with Swiss rounds, live.
-import { configure, rank } from "./engine.js";
+// Shortlist: sort any page by a sentence. The side panel reads the page's text, a fast model picks out
+// the items worth ranking (streamed in one by one), and pairwise judgments rank them while they arrive.
+// The page is read ahead as soon as the panel shows it, so pressing Sort usually goes straight to ranking.
+import { configure, rankLive } from "./engine.js";
 import secrets from "./secrets.js";
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const MODELS = ["gpt-6-luna", "gpt-5.6-luna"];
-const MAX_TEXT = 60000; // characters of page text sent to Luna
-const MAX_ITEMS = 60;
+const MAX_TEXT = 60000; // characters of page text sent to the extractor
+const MAX_ITEMS = 150;
 
 // Starter sentences for the demo pages; anything else gets a generic one.
 const IDEAS = [
   [/ycombinator\.com\/security/, ["how big the vulnerability was", "most data exposed", "easiest to exploit"]],
+  [/news\.ycombinator\.com\/item/, ["most insightful", "first-hand experience", "most useful"]],
   [/linkedin\.com\/in\//, ["most impressive achievement, on merit", "hardest to get", "most relevant to building startups"]],
   [/mail\.google\.com/, ["what matters most to me", "a real person is waiting on my reply"]],
   [/./, ["most important", "most useful to me"]],
@@ -41,11 +43,14 @@ async function showTab() {
   $("#status").hidden = true;
   note(/mail\.google\.com/.test(t.url || "") ? "On Gmail, the Sort button next to “Inbox” reads the full emails and sorts Gmail itself. This panel sorts what's on the page." : "");
   setBusy(false);
+  if (t.status === "complete") readAhead(t);
 }
 chrome.tabs.onActivated.addListener(showTab);
 chrome.tabs.onUpdated.addListener((id, info, t) => {
   if (id !== tab?.id) return;
   if (info.url && info.url !== tab.url) return (tab = null), showTab(); // navigated: a new page
+  if (info.status === "loading") jobs.delete(tab.url); // reloaded: the text read ahead is stale
+  if (info.status === "complete") readAhead(t);
   if (info.title) $("#ptitle").textContent = t.title;
   if (info.favIconUrl) $("#fav").src = t.favIconUrl;
 });
@@ -68,30 +73,63 @@ const status = (stage, meta = "", prog = null, done = false) => {
 };
 
 // ---------- 1. read the page ----------
-async function readPage() {
+async function readPage(t) {
   const [{ result }] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+    target: { tabId: t.id },
     func: () => ({ title: document.title, url: location.href, text: document.body.innerText }),
   });
-  return { ...result, text: result.text.replace(/\n{3,}/g, "\n\n").slice(0, MAX_TEXT) };
+  // Numbered lines, so the model can point at items instead of copying them out.
+  const lines = [];
+  let size = 0;
+  for (const l of result.text.split("\n")) {
+    const t = l.replace(/\s+/g, " ").trim().slice(0, 800);
+    if (!t) continue;
+    if ((size += t.length + 6) > MAX_TEXT) break;
+    lines.push(t);
+  }
+  return { ...result, lines };
 }
 
-// ---------- 2. Luna picks out the items (streamed as JSON lines) ----------
-const PROMPT = (q) => `You pick out the items on a web page that someone wants to rank. They will rank them by: "${q}".
+// ---------- 2. pick out the items (streamed as JSON lines) ----------
+// The sentence isn't part of this step, so one read of a page serves every sentence and can start
+// before anything is typed.
+const PROMPT = `You pick out the items on a web page that someone wants to rank (they'll say by what later).
+The page text is given as numbered lines. Point at the items by line number; don't copy their text.
 Output JSON Lines only: one JSON object per line, no prose, no code fences.
-First line: {"noun": "<singular noun for one item, e.g. finding, achievement, product>"}
-Then one line per item: {"title": "...", "detail": "...", "anchor": "..."}
-- title: who or what it is, at most 8 words. For a list of reports or submissions, start with the person's name.
-- detail: the facts from the page that matter for ranking by the criterion, at most 35 words. Copy facts with their numbers and dates; don't judge.
-- anchor: an exact, verbatim substring of the page text (10 to 60 characters) that is part of this item.
-Be exhaustive: include every item of that kind on the page, at most ${MAX_ITEMS}; when unsure whether something counts, include it.
-If the page is one person's or company's profile, the items are each of their own accomplishments listed separately: every role, company founded, degree, fellowship, award, honor, competition result, investment, fundraise, community or audience built, and notable post with a result (views, attendees, money). Not other people the page suggests.
-Skip navigation, ads, "people also viewed", footers.`;
+First line: {"noun": "<singular noun for one item, e.g. comment, finding, achievement, product>"}
+Then one line per item: {"t": "<label, at most 8 words>", "l": [first, last]}
+- l: the line numbers of the item's own content. For comments or posts, just the text, not the header line with the username and time, and not "reply".
+- t: who or what it is. For comments, reports or submissions: "<username>: <gist in a few words>". On a profile, just the accomplishment, without the person's name.
+- Only if several items share one line, add "d": that item's facts in at most 20 words, copied from the page.
+What the items are: the repeated entries that make up the page's main content. On a discussion or thread page, the comments and replies (not the original post). On a list, feed, table or search page, its entries. On one person's or company's profile, each of their own accomplishments separately: every role, company founded, degree, fellowship, award, competition result, investment, fundraise, community or audience built, and notable post with a result. Never other people the page suggests.
+Be exhaustive: every item of that kind, at most ${MAX_ITEMS}. Skip navigation, ads, "people also viewed", footers.`;
 
-async function extract(page, q, onItem) {
+// Long pages are split into parts read in parallel (a 116-comment thread: 12s in one go).
+const PART = 160; // lines per part
+const OVERLAP = 12; // lines shared by neighbouring parts, so an item on a boundary is seen whole
+
+async function extract(page, onItem, onNoun) {
   const { openai = "" } = await chrome.storage.local.get("openai");
   const key = openai || secrets.openaiKey;
   if (!key) throw new Error("Add an OpenAI key in the settings to read pages.");
+  const n = page.lines.length;
+  const parts = Math.max(1, Math.min(8, Math.ceil(n / PART)));
+  const size = Math.ceil(n / parts);
+  const claimed = new Set(); // first lines of items already taken (parts overlap)
+  const nouns = await Promise.all(
+    Array.from({ length: parts }, (_, k) =>
+      extractPart(key, page, k * size, Math.min(n, (k + 1) * size + OVERLAP), k, parts, onNoun, (it) => {
+        if (claimed.has(it.from)) return;
+        claimed.add(it.from);
+        onItem(it);
+      }),
+    ),
+  );
+  return nouns.find((x) => x !== "item") || "item";
+}
+
+async function extractPart(key, page, from, to, k, parts, onNoun, onItem) {
+  const where = parts > 1 ? `This is part ${k + 1} of ${parts} of the page (lines ${from + 1}-${to}); list the items in this part.\n` : "";
   const ask = (model) =>
     fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -100,10 +138,10 @@ async function extract(page, q, onItem) {
         model,
         stream: true,
         reasoning_effort: "none",
-        max_completion_tokens: 8000,
+        max_completion_tokens: 6000,
         messages: [
-          { role: "system", content: PROMPT(q) },
-          { role: "user", content: `Page: ${page.title}\nURL: ${page.url}\n\n${page.text}` },
+          { role: "system", content: PROMPT },
+          { role: "user", content: `Page: ${page.title}\nURL: ${page.url}\n${where}\n${page.lines.slice(from, to).map((l, i) => `${from + i + 1}| ${l}`).join("\n")}` },
         ],
       }),
     });
@@ -117,8 +155,15 @@ async function extract(page, q, onItem) {
     if (!line.startsWith("{")) return;
     try {
       const o = JSON.parse(line);
-      if (o.noun) noun = String(o.noun).toLowerCase();
-      else if (o.title) onItem({ title: String(o.title), detail: String(o.detail || ""), anchor: String(o.anchor || "") });
+      if (o.noun) onNoun((noun = String(o.noun).toLowerCase()));
+      else if (o.l != null) {
+        const [a, b = a] = [].concat(o.l).map(Number);
+        const own = page.lines.slice(Math.max(0, a - 1), Math.min(page.lines.length, Math.max(a, b)));
+        if (!own.length) return;
+        const text = own.join(" ");
+        const anchor = own.reduce((x, y) => (y.length > x.length ? y : x)).slice(0, 60);
+        onItem({ from: o.d ? `${a}:${o.d}` : a, title: String(o.t || own[0].slice(0, 60)), detail: o.d ? String(o.d) : text, text: (o.d ? o.d + " (from: " : "") + text.slice(0, 1200) + (o.d ? ")" : ""), anchor });
+      }
     } catch {}
   };
   const reader = res.body.getReader();
@@ -139,6 +184,40 @@ async function extract(page, q, onItem) {
   }
   take(out);
   return noun;
+}
+
+// One extraction per page, shared by the read-ahead and every sort on it. Not on Gmail: its own Sort
+// button covers the inbox, and mail shouldn't leave the browser without a click.
+const jobs = new Map(); // url -> { items, noun, subs, done, tEnd }
+function readAhead(t) {
+  if (/^https?:/.test(t.url || "") && !/mail\.google\.com/.test(t.url)) job(t).done.catch(() => {});
+}
+function job(t) {
+  let j = jobs.get(t.url);
+  if (j) return j;
+  j = { items: [], noun: "item", subs: new Set(), tEnd: 0 };
+  const me = j;
+  j.done = (async () => {
+    const page = await readPage(t).catch(() => {
+      throw new Error("Chrome doesn't let extensions read this page. Try a normal website.");
+    });
+    me.page = page;
+    const noun = await extract(
+      page,
+      (it) => {
+        if (me.items.length >= MAX_ITEMS) return;
+        me.items.push(it);
+        for (const f of me.subs) f(it);
+      },
+      (n) => n !== "item" && me.noun === "item" && (me.noun = n),
+    );
+    if (me.noun === "item") me.noun = noun;
+    me.tEnd = performance.now();
+  })();
+  j.done.catch(() => jobs.get(t.url) === me && jobs.delete(t.url)); // a failed read is retried on Sort
+  jobs.set(t.url, j);
+  for (const u of [...jobs.keys()].slice(0, -12)) jobs.delete(u);
+  return j;
 }
 
 // ---------- the list ----------
@@ -200,6 +279,7 @@ async function highlight(it) {
 }
 
 // ---------- 3. sort ----------
+// Ranking starts with the second item and keeps taking items while the page is still being read.
 async function sort(q) {
   q = q.trim();
   if (!q || !tab) return;
@@ -211,62 +291,61 @@ async function sort(q) {
   $("#list").innerHTML = "";
   $("#list").classList.remove("ranked");
   const t0 = performance.now();
-  try {
-    status("Reading the page", "", 0.02);
-    let page;
-    try {
-      page = await readPage();
-    } catch {
-      throw new Error("Chrome doesn't let extensions read this page. Try a normal website.");
-    }
+  const ids = new Map(); // item -> id
+  let ranker = null, decided = 0, budget = 1;
+  const plural = () => `${ids.size} ${j.noun}${ids.size === 1 || j.noun.endsWith("s") ? "" : "s"}`;
+  const elapsed = () => ((performance.now() - t0) / 1000).toFixed(1);
+  const j = job(tab);
+  const ahead = !!j.tEnd;
+  const tick = setInterval(() => {
     if (!live()) return;
-    status("Luna is picking out what to rank", `${Math.round(page.text.length / 1000)}k characters of page text`, 0.05);
-    const items = [];
-    const noun = await extract(page, q, (it) => {
-      if (!live() || items.length >= MAX_ITEMS) return;
-      const id = "i" + items.length;
-      items.push({ id, ...it });
-      addRow(id, it);
-      status("Luna is picking out what to rank", `${items.length} found`, 0.05 + 0.1 * Math.min(1, items.length / 20));
+    const reading = !j.tEnd;
+    const found = ids.size ? `${ids.size} found · ` : "";
+    const meta = ranker ? `${reading ? found : ""}${decided} comparisons · ${elapsed()}s` : `${found}${elapsed()}s`;
+    status(reading ? "Finding what to rank" : `Ranking ${plural()}`, meta, (reading ? 0.05 : 0.15) + 0.85 * Math.min(1, decided / budget));
+  }, 100);
+  const feed = (it) => {
+    if (!live() || ids.has(it)) return;
+    const id = "i" + ids.size;
+    ids.set(it, id);
+    addRow(id, it);
+    if (ranker) return ranker.add({ id, card: { title: it.title, text: it.text } });
+    if (ids.size < 2) return;
+    ranker = rankLive({ noun: j.noun, context: { page: { title: tab.title, url: tab.url } }, criterion: q }, (ev) => {
+      if (!live()) return ranker.stop();
+      if (ev.type === "match") (decided++, flash(ev.a, ev.pA >= 0.5), flash(ev.b, ev.pA < 0.5));
+      if (ev.type === "standings") (reorder(ev.order, ev.record), (budget = ev.budget));
     });
-    if (!live()) return;
-    const tLuna = ((performance.now() - t0) / 1000).toFixed(1);
-    if (items.length < 2) throw new Error(items.length ? "Only one thing on this page to rank." : "Luna didn't find anything to rank here. Try a sentence that names what to rank.");
-
+    for (const [x, xid] of ids) ranker.add({ id: xid, card: { title: x.title, text: x.text } });
+  };
+  try {
     const { key: stored = "" } = await chrome.storage.local.get("key");
     const key = stored || secrets.jevKey;
-    if (!key) throw new Error("Add your Jev API key in the settings.");
+    if (!key) throw new Error("Add your ranking API key in the settings.");
     configure({ key, concurrency: 256 });
-    const plural = `${items.length} ${noun}${items.length === 1 || noun.endsWith("s") ? "" : "s"}`;
-    let rounds = 1, total = 1, decided = 0, label = "";
-    const tRank = performance.now();
-    const tick = setInterval(() => live() && status(label || `Ranking ${plural}`, `${decided} Jev decisions · ${((performance.now() - tRank) / 1000).toFixed(1)}s`, 0.15 + 0.85 * (decided / total)), 100);
+    status(ahead ? "Ranking" : "Reading the page", "", 0.02);
+    j.items.forEach(feed);
+    j.subs.add(feed);
     try {
-      await rank(
-        items.map((it) => ({ id: it.id, card: { title: it.title, detail: it.detail } })),
-        { noun, context: { page: { title: page.title, url: page.url } }, criterion: q, algo: "swiss", plain: true },
-        (ev) => {
-          if (!live()) return;
-          if (ev.type === "plan") (rounds = ev.phases.length - 1), (total = ev.phases.reduce((s, p) => s + (p.total || 0), 0) || 1);
-          if (ev.type === "phase" && ev.key !== "bt") label = `Swiss round ${ev.key.slice(1)} of ${rounds}`;
-          if (ev.type === "match") (decided++, flash(ev.a, ev.pA >= 0.5), flash(ev.b, ev.pA < 0.5));
-          if (ev.type === "standings") reorder(ev.order, ev.record);
-          if (ev.type === "done") {
-            reorder(ev.order, ev.record);
-            $("#list").classList.add("ranked");
-            const secs = ((performance.now() - t0) / 1000).toFixed(1);
-            status(`Sorted ${plural}`, `${secs}s total · Luna ${tLuna}s · ${ev.jev.decisions} Jev decisions in ${rounds} Swiss rounds · $${ev.jev.costUsd.toFixed(4)}`, 1, true);
-          }
-        },
-      );
+      await j.done;
     } finally {
-      clearInterval(tick);
+      j.subs.delete(feed);
     }
+    if (!live()) return ranker?.stop();
+    if (ids.size < 2) throw new Error(ids.size ? "Only one thing on this page to rank." : "Nothing to rank found here. Try a page with a list, a thread or a profile.");
+    const tFind = ((j.tEnd - t0) / 1000).toFixed(1);
+    const ev = await ranker.end();
+    if (!live()) return;
+    reorder(ev.order, ev.record);
+    $("#list").classList.add("ranked");
+    status(`Sorted ${plural()}`, `${elapsed()}s · ${ahead ? "page read ahead" : `found in ${tFind}s`} · ${ev.jev.decisions} comparisons · $${ev.jev.costUsd.toFixed(4)}`, 1, true);
   } catch (e) {
+    ranker?.stop();
     if (!live()) return;
     $("#status").hidden = true;
     note(String(e.message || e), true);
   } finally {
+    clearInterval(tick);
     if (live()) setBusy(false);
   }
 }

@@ -1,8 +1,17 @@
-// Jev Sort for Gmail. Adds a "Sort ▾" button next to the list's heading (or in Gmail's toolbar). Takes the emails on screen (up to 50), has
-// the background read them in full and rank them with Jev by any sentence, then rearranges Gmail's own
+// Shortlist for Gmail. Adds a "Sort ▾" button next to the list's heading (or in Gmail's toolbar). Takes the emails on screen (up to 50), has
+// the background read them in full and rank them by any sentence, then rearranges Gmail's own
 // rows in place, with sections and a "Suggested trash" group. Everything here is client-side; the only
 // change to the account is when you press "Move to Trash", which uses Gmail's own Delete button.
 (() => {
+  // When the extension reloads, the old copy of this script keeps running with a dead connection to
+  // it. That copy stands down (dead() below), and this one clears what it left on the page.
+  let gone = false, observer = null;
+  const dead = () => gone || ((gone = !chrome.runtime?.id) && (observer?.disconnect(), true));
+  for (const el of document.querySelectorAll('[class*="jevx-"]')) {
+    if (el.classList[0]?.startsWith("jevx-")) el.remove();
+    else el.classList.remove(...[...el.classList].filter((c) => c.startsWith("jevx-")));
+  }
+
   const MAX = 50;
   const DEFAULT_Q = "what matters most to me and should be read first";
   // Material Symbols (24px, Apache 2.0) so everything matches Gmail's own icons.
@@ -169,7 +178,7 @@
     if (ok && !hd && tb.contains(split)) return;
     if (!split) {
       split = h(`<div class="jevx-split" role="group">
-        <button class="jevx-sort" data-tooltip="Sort these emails with Jev">${icon("sort", "s0")}${icon("check", "s1")}<span class="jevx-lbl">Sort</span><i class="jevx-bar"></i></button>
+        <button class="jevx-sort" data-tooltip="Sort these emails">${icon("sort", "s0")}${icon("check", "s1")}<span class="jevx-lbl">Sort</span><i class="jevx-bar"></i></button>
         <button class="jevx-caret" data-tooltip="Sort by a sentence" aria-label="Sort by a sentence">${icon("drop")}</button>
       </div>`);
       split.querySelector(".jevx-sort").addEventListener("click", (e) => (e.stopPropagation(), st.running ? null : run(st.q)));
@@ -345,7 +354,7 @@
     return statusEl;
   }
   function paintStatus() {
-    if (!statusEl) return;
+    if (!statusEl?.querySelector(".q")) return; // cleared off the page by a newer copy of this script
     const q = st.q === DEFAULT_Q ? "What matters most" : `“${st.q}”`;
     const secs = ((performance.now() - st.t0) / 1000).toFixed(1);
     statusEl.classList.toggle("running", st.running);
@@ -541,7 +550,7 @@
   }
   for (const t of ["mousedown", "mouseup", "click", "dblclick"])
     addEventListener(t, (e) => {
-      const tr = e.button === 0 && sortedRow(e.target);
+      const tr = e.button === 0 && !dead() && sortedRow(e.target);
       if (!tr) return;
       if (e.target.closest('[role="checkbox"]')) {
         if (!e.shiftKey) return void (t === "click" && (lastBox = tr));
@@ -554,7 +563,7 @@
       if (t === "click") (setCursor(tr), open(tr, true)); // the click goes on to Gmail
     }, true);
   addEventListener("auxclick", (e) => {
-    const tr = e.button === 1 && sortedRow(e.target);
+    const tr = e.button === 1 && !dead() && sortedRow(e.target);
     if (tr && !e.target.closest(CONTROLS)) (swallow(e), window.open(threadUrl(tr), "_blank"));
   }, true);
 
@@ -569,7 +578,7 @@
   addEventListener("keydown", (e) => {
     handled = "";
     const el = e.composedPath()[0];
-    if (!st.order || menu || e.metaKey || e.ctrlKey || e.altKey || el?.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el?.tagName)) return;
+    if (!st.order || menu || dead() || e.metaKey || e.ctrlKey || e.altKey || el?.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el?.tagName)) return;
     const list = listRows();
     if (!list.length || !visible(list[0])) return; // an email is open, not the list
     if (cursor && !list.includes(cursor)) setCursor(null);
@@ -608,6 +617,7 @@
   let checkAt = 0, checkTimer = 0;
   const check = () => {
     checkTimer = 0;
+    if (dead()) return;
     checkAt = performance.now();
     ensureButton();
     warm();
@@ -627,10 +637,11 @@
     else if (statusEl.parentElement.querySelectorAll(":scope > tr.zA").length !== st.listed) schedule(false);
   };
   addEventListener("hashchange", () => setTimeout(check, 300)); // back from an email: sort the list again
-  new MutationObserver(() => {
-    if (st.mutating || checkTimer) return;
+  observer = new MutationObserver(() => {
+    if (st.mutating || checkTimer || dead()) return;
     checkTimer = setTimeout(check, Math.max(0, 500 - (performance.now() - checkAt)));
-  }).observe(document.body, { childList: true, subtree: true });
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
 
   // Tell the background which threads are on screen so it reads them before Sort is pressed, and
   // ask for sort ideas written for this inbox so the menu has them ready when it opens.
@@ -664,7 +675,7 @@
 
   // ---------- run ----------
   async function run(q) {
-    if (st.running) return;
+    if (st.running || dead()) return;
     q = (q || "").trim() || DEFAULT_Q;
     closeMenu();
     if (st.order) reset();
@@ -681,7 +692,7 @@
     if (sc) sc.scrollTop = 0;
     render(false);
     paintButton();
-    const tick = setInterval(() => (st.running ? (paintButton(), paintStatus()) : clearInterval(tick)), 100);
+    const tick = setInterval(() => (st.running && !dead() ? (paintButton(), paintStatus()) : clearInterval(tick)), 100);
     const lat = [];
 
     const port = (st.port = chrome.runtime.connect({ name: "jev" }));
@@ -696,7 +707,7 @@
           toast("Couldn't read the full emails (" + ev.message + "). Sorting by the previews instead.");
           break;
         case "nokey":
-          fail("Add your Jev API key in the extension settings (the settings button in the Sort menu).");
+          fail("Add your ranking API key in the extension settings (the settings button in the Sort menu).");
           break;
         case "plan":
           st.total = ev.phases.reduce((s, p) => s + (p.total || (p.key === "bt" ? 0 : Math.ceil(ev.n / 2))), 0) + ev.n;
@@ -728,7 +739,7 @@
           break;
         case "done": {
           const secs = ((performance.now() - st.t0) / 1000).toFixed(1);
-          Object.assign(st, { order: ev.order, imp: ev.importance, running: false, done: true, stats: ev.presorted ? `${list.length} emails · instant (sorted in the background in ${(ev.ms / 1000).toFixed(1)}s)` : `${list.length} emails · ${secs}s · ${ev.jev.decisions + Object.keys(st.junk).length} Jev decisions · $${ev.jev.costUsd.toFixed(3)}` });
+          Object.assign(st, { order: ev.order, imp: ev.importance, running: false, done: true, stats: ev.presorted ? `${list.length} emails · instant (sorted in the background in ${(ev.ms / 1000).toFixed(1)}s)` : `${list.length} emails · ${secs}s · ${ev.jev.decisions + Object.keys(st.junk).length} comparisons · $${ev.jev.costUsd.toFixed(3)}` });
           clearInterval(tick);
           paintButton();
           paintStatus();

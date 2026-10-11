@@ -406,3 +406,168 @@ export function bradleyTerry(ids: string[], matches: Match[], seed: Map<string, 
   }
   return new Map(ids.map((id) => [id, Math.log(s.get(id)!)]));
 }
+
+// ---------- live ranking: rank while items are still arriving ----------
+// No rounds. Whenever an item is free, it plays the opponent the current fit is least sure about:
+// maximize p(1-p) * (1/games_a + 1/games_b), p = P(a beats b) under Bradley–Terry. A new item starts
+// at the middle of the scale, so its first games are against the middle of the field (a binary
+// search in effect). Each item has at most two games out at a time and plays about log2(n) + 2,
+// the same budget as Swiss, but nothing waits for the slowest call of a round. After the last item
+// arrives, the top 6 also play any neighbour they haven't met. ab/live.ts, 116 items: 1.4-2.1s and
+// Kendall tau 0.87, vs 2.2-2.6s and tau 0.65 for Swiss rounds, for ~15% more calls.
+export function rankLive(task: RankTask, emit: Emit) {
+  const AT_ONCE = 2; // games one item can have out at a time
+  const t0 = performance.now();
+  Object.assign(stats, { calls: 0, decisions: 0, errors: 0, hedges: 0, inputTokens: 0, lat: [] });
+  const ids: string[] = [];
+  const cards = new Map<string, Record<string, unknown>>();
+  const played = new Map<string, Set<string>>();
+  const record = new Map<string, { w: number; l: number }>();
+  const games = new Map<string, number>();
+  const busy = new Map<string, number>(); // games out right now, per item
+  const isBusy = (id: string) => (busy.get(id) || 0) >= AT_ONCE;
+  const matches: Match[] = [];
+  const noSeed = new Map<string, number>();
+  const rule = `Rank each ${task.noun} by this criterion: "${task.criterion}".`;
+  const base = { context: task.context, criterion: task.criterion };
+  let strength = new Map<string, number>();
+  let out = 0, fitAt = 0, dirty = false, ended = false, stopped = false, finished = false, settled = false;
+  let resolveDone: (r: any) => void = () => {};
+  const done = new Promise<any>((r) => (resolveDone = r));
+
+  const target = () => Math.ceil(Math.log2(Math.max(2, ids.length))) + 2;
+  const budget = () => Math.ceil((ids.length * target()) / 2) + 5;
+  const refit = (force = false) => {
+    if (!dirty && !force) return;
+    if (!force && performance.now() - fitAt < 60) return;
+    strength = bradleyTerry(ids, matches, noSeed);
+    fitAt = performance.now();
+    dirty = false;
+  };
+  const order = () => [...ids].sort((x, y) => (strength.get(y) ?? 0) - (strength.get(x) ?? 0));
+  const standings = () => emit({ type: "standings", order: order(), record: Object.fromEntries(record), budget: budget() });
+
+  const play = async (a: string, b: string, phase: string) => {
+    out++;
+    for (const x of [a, b]) busy.set(x, (busy.get(x) || 0) + 1);
+    played.get(a)!.add(b);
+    played.get(b)!.add(a);
+    const swap = Math.random() < 0.5;
+    const [x, y] = swap ? [b, a] : [a, b];
+    try {
+      const r = await jev(
+        { ...base, A: cards.get(x), B: cards.get(y) },
+        {
+          higher: {
+            type: "choice",
+            instructions: [rule, `Which ${task.noun}, \`A\` or \`B\`, ranks higher?`, ...(task.guide || [])],
+            criteria: { A: `${task.noun} A ranks higher`, B: `${task.noun} B ranks higher` },
+          },
+        },
+      );
+      const pX = r.answers.higher.probabilities.A ?? (r.answers.higher.choice === "A" ? 1 : 0);
+      const m: Match = { a, b, pA: swap ? 1 - pX : pX, ms: Math.round(r.ms), phase };
+      matches.push(m);
+      games.set(a, games.get(a)! + 1);
+      games.set(b, games.get(b)! + 1);
+      record.get(m.pA >= 0.5 ? a : b)!.w++;
+      record.get(m.pA >= 0.5 ? b : a)!.l++;
+      dirty = true;
+      emit({ type: "match", ...m });
+    } catch (e) {
+      emit({ type: "error", id: a, message: String(e).slice(0, 160) });
+    } finally {
+      for (const x of [a, b]) busy.set(x, busy.get(x)! - 1);
+      out--;
+      pump();
+    }
+  };
+
+  function pump() {
+    if (stopped || finished) return;
+    refit();
+    const T = target();
+    const free = ids.filter((id) => !isBusy(id));
+    const load = (id: string) => games.get(id)! + (busy.get(id) || 0); // games played or out
+    const need = shuffle(free.filter((id) => load(id) < T)).sort((x, y) => load(x) - load(y));
+    for (const a of need) {
+      while (!isBusy(a) && load(a) < T) {
+        const sa = strength.get(a) ?? 0, ga = load(a);
+        let best = "", bestV = -1;
+        for (const b of free) {
+          if (b === a || isBusy(b) || played.get(a)!.has(b)) continue;
+          const p = 1 / (1 + Math.exp((strength.get(b) ?? 0) - sa));
+          const v = p * (1 - p) * (1 / (ga + 1) + 1 / (load(b) + 1));
+          if (v > bestV) (bestV = v), (best = b);
+        }
+        if (!best) break;
+        play(a, best, "live");
+      }
+    }
+    if (!ended) return;
+    if (!settled && ids.every((id) => games.get(id)! >= T || ids.every((b) => b === id || played.get(id)!.has(b)))) {
+      // Budget spent: the head of the list is what people read, so its neighbours that haven't met
+      // play once, all at the same time (repeating this until stable doubled the wall time).
+      settled = true;
+      refit(true);
+      const top = order().slice(0, 6);
+      for (let i = 0; i + 1 < top.length; i++) {
+        const [a, b] = [top[i], top[i + 1]];
+        if (!isBusy(a) && !isBusy(b) && !played.get(a)!.has(b)) play(a, b, "top");
+      }
+    }
+    if (out === 0) finish();
+  }
+
+  const live = setInterval(() => {
+    if (!dirty) return;
+    refit(true);
+    standings();
+  }, 250);
+
+  function finish() {
+    finished = true;
+    clearInterval(live);
+    refit(true);
+    const final = order();
+    const vals = [...strength.values()];
+    const max = Math.max(...vals), min = Math.min(...vals);
+    const result = {
+      type: "done",
+      algo: "live",
+      order: final,
+      importance: Object.fromEntries(final.map((id) => [id, ((strength.get(id) ?? 0) - min) / (max - min || 1)])),
+      record: Object.fromEntries(record),
+      matches: matches.length,
+      ms: Math.round(performance.now() - t0),
+      jev: summary(),
+    };
+    emit(result);
+    resolveDone(result);
+  }
+
+  return {
+    add(item: RankItem) {
+      if (cards.has(item.id) || ended) return;
+      ids.push(item.id);
+      cards.set(item.id, item.card);
+      played.set(item.id, new Set());
+      record.set(item.id, { w: 0, l: 0 });
+      games.set(item.id, 0);
+      dirty = true;
+      pump();
+    },
+    // No more items are coming. Resolves with the "done" event once the last games are in.
+    end() {
+      ended = true;
+      if (ids.length < 2) finish();
+      else pump();
+      return done;
+    },
+    // Abandon: start no new games (calls already out still land, unreported).
+    stop() {
+      stopped = true;
+      clearInterval(live);
+    },
+  };
+}

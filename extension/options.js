@@ -23,7 +23,7 @@ $("#test").onclick = async () => {
       body: JSON.stringify({ model: "jev-latest", state: { x: 1 }, questions: { ok: { type: "choice", instructions: "Is x equal to 1?", criteria: { yes: "x is 1", no: "x is not 1" } } } }),
     });
     if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 120)}`);
-    status(`Key works · Jev answered in ${Math.round(performance.now() - t0)}ms`);
+    status(`Key works · ranking API answered in ${Math.round(performance.now() - t0)}ms`);
   } catch (e) {
     status("Key failed: " + e.message, true);
   }

@@ -1,5 +1,5 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><title>Jev Sort for Gmail</title>
+<html><head><meta charset="utf-8"><title>Shortlist settings</title>
 <style>
   body { font: 14px/1.5 "Google Sans", Roboto, Arial, sans-serif; color: #1f1f1f; background: #f6f8fc; margin: 0; }
   main { max-width: 620px; margin: 48px auto; background: #fff; border-radius: 16px; padding: 28px 32px; box-shadow: 0 1px 3px rgba(60,64,67,.15); }
@@ -21,10 +21,10 @@
   ul { color: #444746; padding-left: 20px; }
 </style></head>
 <body><main>
-  <h1><img src="icon128.png" alt="">Jev Sort for Gmail</h1>
+  <h1><img src="icon128.png" alt="">Shortlist</h1>
   <p class="sub">Sort your inbox by any sentence. Open Gmail and press <b>Sort</b> next to the Inbox heading, or the arrow beside it to type your own sentence.</p>
 
-  <label for="key">Jev API key <small>(optional: the built-in key is used if empty)</small></label>
+  <label for="key">Ranking API key <small>(optional: the built-in key is used if empty)</small></label>
   <input id="key" type="password" placeholder="apikey_…" autocomplete="off">
   <small>Get one at typesafe.ai. Stored only in this browser (chrome.storage.local) and sent only to api.typesafe.ai.</small>
 
@@ -33,18 +33,18 @@
   <small>Only the sender, subject and a short preview of the emails on screen are sent to api.openai.com, once per inbox.</small>
 
   <label class="check"><input id="presort" type="checkbox" checked> Sort in the background when Gmail opens</label>
-  <small>Makes the Sort button instant. Costs about $0.015 in Jev calls each time the list of emails changes (at most once a minute).</small>
+  <small>Makes the Sort button instant. Costs about $0.015 in ranking calls each time the list of emails changes (at most once a minute).</small>
 
   <label for="about">About you <span style="font-weight:400;color:#5e5e5e">(optional)</span></label>
   <textarea id="about" placeholder="e.g. Founder of a seed-stage startup. Investors, customers and hiring matter most. I ignore newsletters."></textarea>
-  <small>Only used so sentences like "what matters to <i>me</i>" have someone to mean. Leave blank and Jev goes by the sentence alone.</small>
+  <small>Only used so sentences like "what matters to <i>me</i>" have someone to mean. Leave blank and ranking goes by the sentence alone.</small>
 
   <div class="row"><button id="save">Save</button><button id="test" class="ghost">Test key</button><span id="status"></span></div>
 
   <label>Privacy</label>
   <ul>
     <li>Emails are read from the Gmail page you have open: sender, subject, preview and (when available) the first part of the message.</li>
-    <li>Each email's text is sent to Jev to rank it. With an OpenAI key, senders, subjects and short previews are also sent to OpenAI to suggest sort ideas.</li>
+    <li>Each email's text is sent to the ranking API to rank it. With an OpenAI key, senders, subjects and short previews are also sent to OpenAI to suggest sort ideas.</li>
     <li>Sorting only rearranges what's on your screen. The only change to your account is "Move to Trash", which uses Gmail's own Delete button after you confirm, and Gmail's Undo reverses it.</li>
   </ul>
 </main>

@@ -1,4 +1,4 @@
-/* Jev Sort for Gmail. Everything is prefixed jevx- so it never collides with Gmail's classes.
+/* Shortlist for Gmail. Everything is prefixed jevx- so it never collides with Gmail's classes.
    Colours are Gmail's own Material 3 palette: neutral greys, one blue accent, red only for Trash. */
 .jevx-i { width: 20px; height: 20px; fill: currentColor; flex: none; display: block; }
 

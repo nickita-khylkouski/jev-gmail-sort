@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Jev Sort",
-  "version": "1.3.0",
-  "description": "Sort any page by a sentence. A side panel picks out what's on the page and ranks it live with Jev; in Gmail, sort your inbox in place.",
+  "name": "Shortlist",
+  "version": "1.4.0",
+  "description": "Sort any page by a sentence. A side panel picks out what's on the page and ranks it live; in Gmail, sort your inbox in place.",
   "permissions": [
     "storage",
     "sidePanel",
@@ -34,7 +34,7 @@
     "open_in_tab": true
   },
   "action": {
-    "default_title": "Sort this page with Jev"
+    "default_title": "Shortlist this page"
   },
   "icons": {
     "16": "icon16.png",
