@@ -2,6 +2,7 @@
 // items worth ranking (streamed in one by one), then Jev ranks them with Swiss rounds, live.
 import { configure, rank } from "./engine.js";
 import secrets from "./secrets.js";
+import { extractItems } from "./extraction.js";
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -17,7 +18,8 @@ const IDEAS = [
   [/./, ["most important", "most useful to me"]],
 ];
 
-let tab = null, run = 0;
+let tab = null, run = 0, extraction = null;
+addEventListener("pagehide", () => extraction?.abort());
 const fixedTab = new URLSearchParams(location.search).get("tab"); // tests open the panel as a tab
 
 async function currentTab() {
@@ -30,6 +32,7 @@ async function showTab() {
   const t = await currentTab().catch(() => null);
   if (!t || (tab && t.id === tab.id && t.url === tab.url)) return;
   tab = t;
+  extraction?.abort();
   run++; // a different page: whatever was running is for the old one
   $("#ptitle").textContent = t.title || "This page";
   $("#phost").textContent = t.url ? new URL(t.url).hostname.replace(/^www\./, "") : "";
@@ -87,59 +90,6 @@ Then one line per item: {"title": "...", "detail": "...", "anchor": "..."}
 Be exhaustive: include every item of that kind on the page, at most ${MAX_ITEMS}; when unsure whether something counts, include it.
 If the page is one person's or company's profile, the items are each of their own accomplishments listed separately: every role, company founded, degree, fellowship, award, honor, competition result, investment, fundraise, community or audience built, and notable post with a result (views, attendees, money). Not other people the page suggests.
 Skip navigation, ads, "people also viewed", footers.`;
-
-async function extract(page, q, onItem) {
-  const { openai = "" } = await chrome.storage.local.get("openai");
-  const key = openai || secrets.openaiKey;
-  if (!key) throw new Error("Add an OpenAI key in the settings to read pages.");
-  const ask = (model) =>
-    fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        model,
-        stream: true,
-        reasoning_effort: "none",
-        max_completion_tokens: 8000,
-        messages: [
-          { role: "system", content: PROMPT(q) },
-          { role: "user", content: `Page: ${page.title}\nURL: ${page.url}\n\n${page.text}` },
-        ],
-      }),
-    });
-  let res = await ask(MODELS[0]);
-  if (res.status === 400 || res.status === 404) res = await ask(MODELS[1]);
-  if (!res.ok) throw new Error(`OpenAI ${res.status}: ${(await res.text()).slice(0, 200)}`);
-
-  let noun = "item", out = "", sse = "";
-  const take = (line) => {
-    line = line.trim().replace(/^```\w*|```$/g, "").replace(/,$/, "");
-    if (!line.startsWith("{")) return;
-    try {
-      const o = JSON.parse(line);
-      if (o.noun) noun = String(o.noun).toLowerCase();
-      else if (o.title) onItem({ title: String(o.title), detail: String(o.detail || ""), anchor: String(o.anchor || "") });
-    } catch {}
-  };
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    sse += dec.decode(value, { stream: true });
-    let i;
-    while ((i = sse.indexOf("\n")) >= 0) {
-      const ev = sse.slice(0, i).trim();
-      sse = sse.slice(i + 1);
-      if (!ev.startsWith("data:") || ev === "data: [DONE]") continue;
-      out += JSON.parse(ev.slice(5)).choices?.[0]?.delta?.content || "";
-      let j;
-      while ((j = out.indexOf("\n")) >= 0) (take(out.slice(0, j)), (out = out.slice(j + 1)));
-    }
-  }
-  take(out);
-  return noun;
-}
 
 // ---------- the list ----------
 const rows = new Map(); // id -> li
@@ -204,6 +154,8 @@ async function sort(q) {
   q = q.trim();
   if (!q || !tab) return;
   const me = ++run;
+  extraction?.abort();
+  const ctl = (extraction = new AbortController());
   const live = () => me === run;
   setBusy(true);
   note("");
@@ -222,13 +174,15 @@ async function sort(q) {
     if (!live()) return;
     status("Luna is picking out what to rank", `${Math.round(page.text.length / 1000)}k characters of page text`, 0.05);
     const items = [];
-    const noun = await extract(page, q, (it) => {
+    const { openai = "" } = await chrome.storage.local.get("openai");
+    if (!live()) return;
+    const noun = await extractItems(page, (it) => {
       if (!live() || items.length >= MAX_ITEMS) return;
       const id = "i" + items.length;
       items.push({ id, ...it });
       addRow(id, it);
       status("Luna is picking out what to rank", `${items.length} found`, 0.05 + 0.1 * Math.min(1, items.length / 20));
-    });
+    }, { key: openai || secrets.openaiKey, prompt: PROMPT(q), models: MODELS, signal: ctl.signal });
     if (!live()) return;
     const tLuna = ((performance.now() - t0) / 1000).toFixed(1);
     if (items.length < 2) throw new Error(items.length ? "Only one thing on this page to rank." : "Luna didn't find anything to rank here. Try a sentence that names what to rank.");
@@ -267,6 +221,7 @@ async function sort(q) {
     $("#status").hidden = true;
     note(String(e.message || e), true);
   } finally {
+    if (extraction === ctl) extraction = null;
     if (live()) setBusy(false);
   }
 }
