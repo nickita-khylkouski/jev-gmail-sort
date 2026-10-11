@@ -52,15 +52,20 @@ function jev(state, questions) {
     try {
       const r = await new Promise((resolve, reject) => {
         let failed = 0;
+        let lastError;
         const launch = (c) => once(body, c.signal).then(resolve, (e) => {
+          lastError = e;
           if (++failed === ctl.length && (ctl.length > 1 || !timer))
             reject(e);
         });
         launch(ctl[0]);
         timer = setTimeout(() => {
           timer = undefined;
-          if (stats.hedges > 8 + stats.calls * 0.15)
+          if (stats.hedges > 8 + stats.calls * 0.15) {
+            if (failed === ctl.length)
+              reject(lastError);
             return;
+          }
           stats.hedges++;
           const c = new AbortController;
           ctl.push(c);
@@ -335,9 +340,9 @@ function bradleyTerry(ids, matches, seed) {
   return new Map(ids.map((id) => [id, Math.log(s.get(id))]));
 }
 export {
-  summary,
-  rank,
-  jev,
+  bradleyTerry,
   configure,
-  bradleyTerry
+  jev,
+  rank,
+  summary
 };

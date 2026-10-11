@@ -64,14 +64,21 @@ export function jev(state: unknown, questions: Record<string, unknown>): Promise
     try {
       const r: any = await new Promise((resolve, reject) => {
         let failed = 0;
+        let lastError: unknown;
         const launch = (c: AbortController) =>
           once(body, c.signal).then(resolve, (e) => {
+            lastError = e;
             if (++failed === ctl.length && (ctl.length > 1 || !timer)) reject(e);
           });
         launch(ctl[0]);
         timer = setTimeout(() => {
           timer = undefined;
-          if (stats.hedges > 8 + stats.calls * 0.15) return; // during a backend-wide slowdown, hedging only adds load
+          if (stats.hedges > 8 + stats.calls * 0.15) {
+            // During a backend-wide slowdown, hedging only adds load. If the primary already
+            // failed, settle it here: there will be no duplicate to resolve or reject this call.
+            if (failed === ctl.length) reject(lastError);
+            return;
+          }
           stats.hedges++;
           const c = new AbortController();
           ctl.push(c);
