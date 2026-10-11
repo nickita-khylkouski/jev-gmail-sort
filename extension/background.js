@@ -2,6 +2,7 @@
 // API (read-only) for full bodies, then rank them with Jev.
 import { configure, jev, rank } from "./engine.js";
 import { cards, prefetch } from "./gmail.js";
+import { jobKey } from "./job-key.js";
 import secrets from "./secrets.js";
 
 const GUIDE = [
@@ -110,7 +111,6 @@ chrome.runtime.onMessage.addListener((m, _sender, reply) => {
 // job the background already started when Gmail loaded (or replays its finished result), so most
 // clicks show the sorted inbox at once instead of waiting ~3s for Jev.
 const jobs = new Map(); // key -> { key, log, subs, done, at }
-const jobKey = (ids, q) => q + "\n" + ids.join(",");
 const FRESH = 30 * 60e3; // reuse a finished sort for half an hour
 
 // What a late joiner needs: the result and the per-email answers, not 300 individual matches.
@@ -134,7 +134,7 @@ async function findJob(key) {
 }
 
 function startJob(rows, q, owner, budget) {
-  const key = jobKey(rows.map((r) => r.id), q);
+  const key = jobKey(rows, q, owner);
   const job = { key, log: [], subs: new Set(), done: false, at: Date.now() };
   jobs.set(key, job);
   for (const k of [...jobs.keys()].slice(0, -6)) jobs.delete(k);
@@ -207,7 +207,7 @@ async function presort(m) {
   clearTimeout(presortTimer);
   presortTimer = setTimeout(async () => {
     const q = (m.q || "").trim() || DEFAULT_Q;
-    if (Date.now() - presortAt < 60e3 || (await findJob(jobKey(m.rows.map((r) => r.id), q)))) return;
+    if (Date.now() - presortAt < 60e3 || (await findJob(jobKey(m.rows, q, m.owner)))) return;
     presortAt = Date.now();
     startJob(m.rows, q, m.owner, 15000);
   }, 1500);
@@ -226,7 +226,7 @@ chrome.runtime.onConnect.addListener((port) => {
     if (msg.type !== "rank") return;
     const q = (msg.q || "").trim() || DEFAULT_Q;
     const rows = msg.rows.slice(0, 50);
-    job = (await findJob(jobKey(rows.map((r) => r.id), q))) || startJob(rows, q, msg.owner, 3000);
+    job = (await findJob(jobKey(rows, q, msg.owner))) || startJob(rows, q, msg.owner, 3000);
     // Catch up on what already happened, then follow along. No await in between, so nothing is missed.
     for (const ev of replay(job.log, job.done)) emit(ev);
     if (!job.done) job.subs.add((sub = emit));

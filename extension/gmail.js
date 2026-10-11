@@ -114,20 +114,28 @@ const paced = async () => {
 
 // Cards are cached in session storage (memory only, cleared when Chrome quits), so they survive the
 // service worker going idle. In-flight reads are shared, so a prefetch and a sort never double up.
-const cache = new Map();
+const CACHE_MS = 2 * 60e3;
+const fresh = (entry) => entry?.card && Number.isFinite(entry.at) && Date.now() >= entry.at && Date.now() - entry.at < CACHE_MS;
+const cache = new Map(); // id -> { at, card }; thread ids remain the same when a new reply arrives
 const inflight = new Map();
 const load = async (id) => {
-  if (cache.has(id)) return cache.get(id);
+  const memory = cache.get(id);
+  if (fresh(memory)) return memory.card;
+  cache.delete(id);
   const k = "c:" + id;
   const stored = (await chrome.storage.session.get(k))[k];
-  if (stored) return cache.set(id, stored), stored;
+  if (fresh(stored)) return cache.set(id, stored), stored.card;
   if (!inflight.has(id))
     inflight.set(id, (async () => {
       try {
         await paced();
         const c = await thread(id, await account());
-        cache.set(id, c);
-        if (c) chrome.storage.session.set({ [k]: c }).catch(() => {});
+        // An all-draft thread may become a sent message on the very next read.
+        if (c) {
+          const entry = { at: Date.now(), card: c };
+          cache.set(id, entry);
+          chrome.storage.session.set({ [k]: entry }).catch(() => {});
+        }
         return c;
       } catch (e) {
         if (e.status !== 404) console.warn("thread", id, String(e).slice(0, 160)); // 404: a different account's Gmail tab
