@@ -3,3 +3,4 @@ data/
 node_modules/
 owner.json
 .DS_Store
+native/build/

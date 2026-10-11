@@ -1,0 +1,5 @@
+.jevx-spell-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 0;font:12px Arial,sans-serif;color:#5f6368}
+.jevx-spell-tools button{border:1px solid #dadce0;border-radius:16px;background:#f0f4ff;color:#174ea6;padding:6px 12px;cursor:pointer;white-space:nowrap}
+.jevx-spell-tools button:disabled{opacity:.55;cursor:progress}
+.jevx-spell-tools input{border:1px solid #dadce0;border-radius:6px;padding:6px 8px;max-width:200px;font:inherit;color:#202124;background:#fff}
+.jevx-spell-note{max-width:340px;line-height:1.4}

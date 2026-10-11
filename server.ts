@@ -1,6 +1,10 @@
-import { fetchInbox, type Thread } from "./src/gmail";
+import { fetchInbox, fetchThreadContext, type Thread } from "./src/gmail";
 import { rank } from "./src/rank";
 import { emailTask } from "./src/emails";
+import { spellcheckRequest } from "./src/spellcheck";
+import { companionHandler } from "./src/companion";
+import { companionToken } from "./src/companion-config";
+import { localOrigin } from "./src/local-origin";
 
 const PORT = Number(process.env.PORT || 8383);
 const CACHE = "data/inbox.json";
@@ -46,11 +50,18 @@ const listView = (t: Thread) => {
   return { ...rest, count: messages.length, attachments: messages.flatMap((m) => m.attachments).slice(0, 3) };
 };
 
+const companion = companionHandler({ token: await companionToken(), recent: () => loadRecent(24), thread: fetchThreadContext });
+
 Bun.serve({
+  hostname: "127.0.0.1",
   port: PORT,
   idleTimeout: 120,
   async fetch(req) {
     const url = new URL(req.url);
+    if (url.pathname.startsWith("/api/") && !localOrigin(req)) return Response.json({ error: "Origin denied." }, { status: 403 });
+    const companionResponse = await companion(req);
+    if (companionResponse) return companionResponse;
+    if (url.pathname === "/api/spellcheck") return spellcheckRequest(req);
     try {
       if (url.pathname === "/api/inbox") {
         await load(url.searchParams.get("refresh") === "1");
@@ -73,17 +84,19 @@ Bun.serve({
         const algo = a === "swiss" || a === "pivot" || a === "full" ? a : "auto";
         const { items, task } = emailTask(threads, src.email.toLowerCase(), (url.searchParams.get("q") || "").slice(0, 300), algo);
         const enc = new TextEncoder();
+        const ctl = new AbortController(), signal = AbortSignal.any([req.signal, ctl.signal]);
         const stream = new ReadableStream({
           async start(ctrl) {
-            const emit = (ev: Record<string, unknown>) => ctrl.enqueue(enc.encode(`data: ${JSON.stringify(ev)}\n\n`));
+            const emit = (ev: Record<string, unknown>) => { if (!signal.aborted) ctrl.enqueue(enc.encode(`data: ${JSON.stringify(ev)}\n\n`)); };
             try {
-              const r = await rank(items, task, emit);
+              const r = await rank(items, task, emit, signal);
               console.log(`[${algo}] "${task.criterion}" ranked ${items.length} in ${r.ms}ms · ${r.jev.calls} calls / ${r.jev.decisions} decisions · p50 ${r.jev.p50}ms p90 ${r.jev.p90}ms · ${r.jev.hedges} hedged · $${r.jev.costUsd.toFixed(4)}`);
             } catch (e) {
               emit({ type: "fatal", message: String(e) });
             }
-            ctrl.close();
+            if (!signal.aborted) ctrl.close();
           },
+          cancel() { ctl.abort(); },
         });
         return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
       }

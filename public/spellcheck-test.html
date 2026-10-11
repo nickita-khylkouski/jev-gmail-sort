@@ -1,0 +1,77 @@
+<!doctype html>
+<meta charset="utf-8"><title>Jev Gmail spell-check tests</title>
+<link rel="stylesheet" href="/extension/content.css"><link rel="stylesheet" href="/extension/spellcheck.css">
+<style>body{font:15px Arial,sans-serif;background:#f6f8fc;margin:32px;color:#202124}h1{font-size:24px}.compose{margin:20px 0;background:white;padding:18px;border-radius:12px;max-width:900px}.Am{padding:16px;min-height:70px;border:1px solid #dadce0;border-radius:6px}#results{white-space:pre-wrap;line-height:1.6}blockquote,.gmail_signature{color:#666}.a3s{margin:15px 0}</style>
+<h1>Jev Gmail: spell-check regression tests</h1>
+<p>Invented drafts; mocked Jev decisions. No Google credentials or provider requests.</p>
+<div gh="mtb"></div><div role="main"><table><tbody><tr class="zA"><td><span data-legacy-thread-id="synthetic01">Synthetic inbox row</span></td></tr></tbody></table></div>
+<div class="a3s">Previous sender: Please request permission for the meeting.</div>
+<div class="compose" role="dialog"><input name="subjectbox" value="Meeting permission"><span email="professor@example.test" data-name="Professor">Professor</span>
+<div id="draft-a" class="Am" contenteditable="true" g_editable="true" role="textbox" aria-label="Draft A"><b>teh</b> reqest <a href="https://example.test/teh">teh link</a><div class="gmail_signature">teh signature</div><blockquote>teh quoted reply</blockquote></div></div>
+<div class="compose" role="dialog"><input name="subjectbox" value="Another conversation"><div id="draft-b" class="Am" contenteditable="true" g_editable="true" role="textbox" aria-label="Draft B">teh other draft</div></div>
+<pre id="results">Running browser tests…</pre>
+<script>
+const requests = []; let pending = null, behavior = 'normal';
+function response(draft) {
+  const fixes = { teh: 'the', reqest: 'request' };
+  return { changes: [...draft.matchAll(/\b(teh|reqest)\b/g)].map((m) => ({ start:m.index,end:m.index+m[0].length,original:m[0],replacement:fixes[m[0]] })), checked:2, ms:150 };
+}
+window.chrome = { runtime: {
+  sendMessage: async (message) => {
+    if (message.type === 'recent') return { email:'test@example.test', threads:[] };
+    requests.push(message);
+    if (behavior === 'pending') return new Promise((resolve) => { pending = () => resolve(response(message.draft)); });
+    if (behavior === 'invalid') return { changes:[{start:0,end:3,original:'teh',replacement:'<script>'}] };
+    return response(message.draft);
+  }, connect: () => ({ onMessage:{addListener(){}}, disconnect(){}, postMessage(){} })
+} };
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+const shortcut = (editor) => { editor.focus(); editor.dispatchEvent(new KeyboardEvent('keydown',{key:'F8',code:'F8',bubbles:true,cancelable:true})); };
+window.addEventListener('load', async () => {
+  const results = [], a = document.querySelector('#draft-a'), b = document.querySelector('#draft-b'), original = a.innerHTML;
+  const check = (condition, label) => { if (!condition) throw new Error(label); results.push('PASS: '+label); };
+  try {
+    check(!!document.querySelector('.jevx-sort'), 'existing Sort toolbar is retained');
+    check(document.querySelectorAll('.jevx-spell-tools').length === 2, 'each compose window gets its own spell check');
+    document.querySelector('.jevx-spell-tools input').value = 'email to my professor';
+    shortcut(a); await tick();
+    check(requests.length === 1 && requests[0].context.subject === 'Meeting permission' && requests[0].context.purpose === 'email to my professor', 'single-key F8 sends one request with the active writing context');
+    check(requests[0].context.thread.includes('quoted reply') && requests[0].context.recipients.includes('Professor') && !requests[0].draft.includes('quoted reply') && !requests[0].draft.includes('signature'), 'own thread guides fixes while quoted replies and signatures stay protected');
+    check(a.querySelector('b').textContent === 'the' && a.textContent.includes('request'), 'confident word fixes apply in place');
+    check(a.querySelector('a').textContent === 'teh link' && a.querySelector('a').href === 'https://example.test/teh', 'link markup and text are preserved');
+    check(a.querySelector('blockquote').textContent === 'teh quoted reply' && a.querySelector('.gmail_signature').textContent === 'teh signature', 'quoted history and signatures remain untouched');
+    check(b.textContent === 'teh other draft', 'another compose window is never edited');
+    // Native editing commands preserve browser undo history for the corrected spans.
+    a.focus(); document.execCommand('undo'); document.execCommand('undo');
+    check(a.querySelector('b').textContent === 'teh' && a.textContent.includes('reqest'), 'browser Undo can restore the original words');
+    a.innerHTML = original; behavior = 'pending'; shortcut(a); await tick();
+    a.appendChild(document.createTextNode(' Newer typing.')); pending(); await tick();
+    check(a.querySelector('b').textContent === 'teh' && a.textContent.includes('Newer typing.'), 'typing during a request prevents stale corrections');
+    a.innerHTML = original; shortcut(a); await tick(); b.focus(); pending(); await tick();
+    check(a.querySelector('b').textContent === 'teh', 'moving focus to another draft prevents an automatic edit');
+    shortcut(a); await tick(); document.querySelector('.jevx-spell-tools input').value = 'a changed purpose'; pending(); await tick();
+    check(a.querySelector('b').textContent === 'teh', 'changed writing context prevents a stale edit');
+    behavior = 'invalid'; shortcut(a); await tick();
+    check(a.innerHTML === original && !a.querySelector('script'), 'invalid replacement content is rejected before editing');
+    const before = requests.length; a.dispatchEvent(new KeyboardEvent('keydown',{key:'a',code:'KeyA',bubbles:true})); await tick();
+    check(requests.length === before, 'ordinary typing never captures or sends a draft');
+    behavior = 'normal'; a.innerHTML = original; document.querySelector('input[name="subjectbox"]').focus();
+    a.previousElementSibling.querySelector('button').click(); await tick();
+    check(a.querySelector('b').textContent === 'the', 'the explicit button checks its draft even when Subject was focused');
+    const firstDraft = a.innerHTML; a.focus(); b.previousElementSibling.querySelector('button').click(); await tick();
+    check(b.textContent === 'the other draft' && a.innerHTML === firstDraft, 'clicking another draft button targets that draft only');
+    a.innerHTML = '<b>permis</b>sion and teh'; shortcut(a); await tick();
+    check(requests.at(-1).draft.includes('permission') && a.querySelector('b').textContent === 'permis' && a.textContent === 'permission and the', 'inline formatting preserves complete words and their markup');
+    a.innerHTML = '<span>permis</span><a href="https://example.test/">sion</a> teh'; shortcut(a); await tick();
+    check(requests.at(-1).draft.includes('permis__protected0__') && !requests.at(-1).draft.includes('sion') && a.querySelector('span').textContent === 'permis' && a.textContent.endsWith('the'), 'excluded inline content protects adjoining partial words');
+    a.innerHTML = '<b>t</b>eh reqest'; shortcut(a); await tick();
+    check(a.querySelector('b').textContent === 't' && a.textContent === 'teh request', 'cross-node fixes are skipped while safe independent fixes still apply');
+    a.innerHTML = 'teh reqest'; behavior = 'pending'; shortcut(a); await tick();
+    const range = document.createRange(); range.selectNodeContents(a); range.collapse(false); window.getSelection().removeAllRanges(); window.getSelection().addRange(range);
+    pending(); await tick();
+    check(a.textContent === 'teh reqest' && a.previousElementSibling.textContent.includes('Selection changed'), 'moving the caret during a request never restores an old selection or applies stale fixes');
+    document.querySelector('#results').textContent = results.join('\n')+'\n\n'+results.length+' browser checks passed.';
+  } catch (error) { document.querySelector('#results').textContent = results.join('\n')+'\nFAIL: '+error.message; }
+});
+</script>
+<script src="/extension/content.js"></script><script src="/extension/spellcheck.js"></script>

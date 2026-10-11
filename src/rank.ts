@@ -1,18 +1,32 @@
 // Generic "sort by judgment" engine on top of Jev. Items are opaque cards; the criterion is a sentence.
+import { setTimeout as sleep } from "node:timers/promises";
 
 // ---------- Jev client ----------
 const JEV = "https://api.typesafe.ai/v1/systemone";
 const CONCURRENCY = Number(process.env.JEV_CONCURRENCY || 256);
 let active = 0;
 const waiting: (() => void)[] = [];
-async function slot<T>(f: () => Promise<T>): Promise<T> {
-  if (active >= CONCURRENCY) await new Promise<void>((r) => waiting.push(r));
-  active++;
+async function slot<T>(f: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  if (active >= CONCURRENCY) await new Promise<void>((resolve, reject) => {
+    const ready = () => { signal.removeEventListener("abort", abort); resolve(); };
+    const abort = () => {
+      const index = waiting.indexOf(ready);
+      if (index >= 0) waiting.splice(index, 1);
+      reject(signal.reason);
+    };
+    waiting.push(ready);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
+  else active++;
   try {
+    signal.throwIfAborted();
     return await f();
   } finally {
-    active--;
-    waiting.shift()?.();
+    // Hand the occupied slot directly to its waiter; a new call cannot overtake it.
+    const next = waiting.shift();
+    if (next) next(); else active--;
   }
 }
 
@@ -30,41 +44,54 @@ const stats = { calls: 0, decisions: 0, errors: 0, hedges: 0, inputTokens: 0, la
 let p50 = 200;
 const hedgeAfter = () => Math.min(900, Math.max(300, 3 * p50));
 
-async function once(body: string, signal: AbortSignal) {
+async function once(body: string, signal: AbortSignal, options: JevOptions) {
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(JEV, {
+    const res = await (options.fetch || fetch)(JEV, {
       method: "POST",
-      headers: { Authorization: `Bearer ${process.env.TYPESAFE_API_KEY}`, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${options.key ?? process.env.TYPESAFE_API_KEY}`, "Content-Type": "application/json" },
       body,
       signal,
     });
     if (res.ok) return res.json() as Promise<any>;
     const text = await res.text();
     if ((res.status === 429 || res.status >= 500) && attempt < 4) {
-      await Bun.sleep(150 * 2 ** attempt);
+      await sleep(150 * 2 ** attempt, undefined, { signal });
       continue;
     }
     throw new Error(`jev ${res.status}: ${text.slice(0, 200)}`);
   }
 }
 
-function jev(state: unknown, questions: Record<string, unknown>): Promise<{ answers: Record<string, Answer>; ms: number }> {
+export interface JevOptions { key?: string; signal?: AbortSignal; fetch?: typeof fetch; recordStats?: boolean }
+// Additional tools reuse the same bounded client without contaminating tournament statistics.
+export function jev(state: unknown, questions: Record<string, unknown>, options: JevOptions = {}): Promise<{ answers: Record<string, Answer>; ms: number }> {
+  const recording = options.recordStats !== false;
+  // Preserve tournament queue/retry behavior. Only on-demand ancillary calls have an 8s deadline.
+  const signal = recording ? options.signal ?? new AbortController().signal
+    : AbortSignal.any([AbortSignal.timeout(8000), ...(options.signal ? [options.signal] : [])]);
   return slot(async () => {
+    signal.throwIfAborted();
     const body = JSON.stringify({ model: "jev-latest", state, questions });
     const t0 = performance.now();
     const ctl = [new AbortController()];
+    const abort = () => ctl.forEach((c) => c.abort(signal.reason));
+    signal.addEventListener("abort", abort, { once: true });
     let timer: Timer | undefined;
     try {
       const r: any = await new Promise((resolve, reject) => {
         let failed = 0;
         const launch = (c: AbortController) =>
-          once(body, c.signal).then(resolve, (e) => {
-            if (++failed === ctl.length && (ctl.length > 1 || !timer)) reject(e);
+          once(body, AbortSignal.any([c.signal, signal]), options).then(resolve, (e) => {
+            failed++;
+            if (!recording || signal.aborted || (failed === ctl.length && (ctl.length > 1 || !timer))) reject(e);
           });
         launch(ctl[0]);
-        timer = setTimeout(() => {
+        if (recording) timer = setTimeout(() => {
           timer = undefined;
-          if (stats.hedges > 8 + stats.calls * 0.15) return; // during a backend-wide slowdown, hedging only adds load
+          if (stats.hedges > 8 + stats.calls * 0.15) {
+            if (failed === ctl.length) reject(new Error("Jev request failed"));
+            return;
+          } // during a backend-wide slowdown, hedging only adds load
           stats.hedges++;
           const c = new AbortController();
           ctl.push(c);
@@ -72,19 +99,22 @@ function jev(state: unknown, questions: Record<string, unknown>): Promise<{ answ
         }, hedgeAfter());
       });
       const ms = performance.now() - t0;
-      stats.calls++;
-      stats.decisions += Object.keys(questions).length;
-      stats.inputTokens += r.usage?.input_tokens || 0;
-      stats.lat.push(ms);
-      p50 = p50 * 0.95 + Math.min(ms, 2000) * 0.05;
+      if (recording) {
+        stats.calls++;
+        stats.decisions += Object.keys(questions).length;
+        stats.inputTokens += r.usage?.input_tokens || 0;
+        stats.lat.push(ms);
+        p50 = p50 * 0.95 + Math.min(ms, 2000) * 0.05;
+      }
       return { answers: r.answers, ms };
-    } catch (e) {
-      stats.errors++;
-      throw e;
     } finally {
       clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
       for (const c of ctl) c.abort();
     }
+  }, signal).catch((error) => {
+    if (recording) stats.errors++;
+    throw error;
   });
 }
 
@@ -139,7 +169,8 @@ const shuffle = <T>(xs: T[]) => {
   return xs;
 };
 
-export async function rank(items: RankItem[], task: RankTask, emit: Emit) {
+export async function rank(items: RankItem[], task: RankTask, emit: Emit, signal?: AbortSignal) {
+  signal?.throwIfAborted();
   const t0 = performance.now();
   Object.assign(stats, { calls: 0, decisions: 0, errors: 0, hedges: 0, inputTokens: 0, lat: [] });
   const ids = items.map((t) => t.id);
@@ -209,10 +240,12 @@ export async function rank(items: RankItem[], task: RankTask, emit: Emit) {
             criteria: { A: `${task.noun} A ranks higher`, B: `${task.noun} B ranks higher` },
           },
         },
+        { signal },
       );
       const pX = r.answers.higher.probabilities.A ?? (r.answers.higher.choice === "A" ? 1 : 0);
       record1(a, b, swap ? 1 - pX : pX, r.ms, phase);
     } catch (e) {
+      signal?.throwIfAborted();
       emit({ type: "error", id: a, message: String(e).slice(0, 160) });
     }
   };
@@ -234,11 +267,13 @@ export async function rank(items: RankItem[], task: RankTask, emit: Emit) {
           const r = await jev(
             { ...base, item: cards.get(id) },
             { tier: { type: "choice", instructions: [rule, `How well does \`item\` match the criterion?`, ...(task.guide || [])], criteria: TIERS } },
+            { signal },
           );
           const a = r.answers.tier;
           seed.set(id, Object.entries(a.probabilities).reduce((s, [k, p]) => s + (TIER_VALUE[k] ?? 0) * p, 0));
           emit({ type: "triage", id, tier: a.choice, value: seed.get(id), conf: a.confidence, ms: Math.round(r.ms) });
         } catch (e) {
+          signal?.throwIfAborted();
           seed.set(id, 2);
           emit({ type: "error", id, message: String(e).slice(0, 160) });
         }
@@ -252,8 +287,8 @@ export async function rank(items: RankItem[], task: RankTask, emit: Emit) {
     shuffle(all);
     emit({ type: "phase", key: "triage", total: n });
     const live = setInterval(() => standings(orderBy(fit())), 250);
-    await Promise.all([triage(), wave("full", all)]);
-    clearInterval(live);
+    try { await Promise.all([triage(), wave("full", all)]); }
+    finally { clearInterval(live); }
     const strength = fit();
     return finish(strength);
   }
@@ -305,12 +340,13 @@ export async function rank(items: RankItem[], task: RankTask, emit: Emit) {
           }),
         );
         try {
-          const r = await jev({ ...base, pivots: Object.fromEntries(names.map((p, k) => [p, lite(cards.get(pivots[k]))])), item: cards.get(id) }, questions);
+          const r = await jev({ ...base, pivots: Object.fromEntries(names.map((p, k) => [p, lite(cards.get(pivots[k]))])), item: cards.get(id) }, questions, { signal });
           names.forEach((p, k) => {
             const a = r.answers[`vs_${p}`];
             if (a) record1(id, pivots[k], a.probabilities.item ?? (a.choice === "item" ? 1 : 0), r.ms, "pivot");
           });
         } catch (e) {
+          signal?.throwIfAborted();
           emit({ type: "error", id, message: String(e).slice(0, 160) });
         }
       });

@@ -1,0 +1,68 @@
+<!doctype html><meta charset="utf-8"><title>Jev Glance integration tests</title>
+<link rel="stylesheet" href="/extension/content.css">
+<style>body{font:15px Arial;margin:30px;background:#f6f8fc;color:#202124}[role=main]{background:white;padding:20px;border-radius:16px;max-width:800px}td{padding:16px}#results{white-space:pre-wrap;line-height:1.6}</style>
+<h1>Jev × Glance integration checks</h1><p>Invented Gmail rows and mocked tournament events. No Google or provider requests.</p>
+<div role="main"><div gh="mtb"></div><table><tbody id="rows">
+<tr class="zA"><td class="yX">Newsletter</td><td class="xT"><span class="bog" data-legacy-thread-id="abc12345">Routine newsletter</span></td></tr>
+<tr class="zA"><td class="yX">Alex</td><td class="xT"><span class="bog" data-legacy-thread-id="def67890">Please confirm the meeting</span></td></tr>
+</tbody></table></div><pre id="results">Running…</pre>
+<script>
+location.hash = '#inbox';
+const listeners = [], calls = []; let events = null, releaseMeta = null, holdMeta = false, disconnects = 0;
+const threads = [{id:'abc12345',subject:'Routine newsletter',from:{name:'Newsletter',email:'newsletter@example.test'},senders:['Newsletter']},
+  {id:'def67890',subject:'Please confirm the meeting',from:{name:'Alex',email:'alex@example.test'},senders:['Alex']}];
+window.chrome = {runtime:{onMessage:{addListener:f=>listeners.push(f)},
+ sendMessage:async msg=>{calls.push(msg);if(holdMeta)return new Promise(resolve=>{releaseMeta=()=>resolve({email:'me@example.test',threads});});return {email:'me@example.test',threads};},
+ connect:()=>{const handlers=[];return {onMessage:{addListener:f=>handlers.push(f)},disconnect(){disconnects++;},postMessage(msg){
+   calls.push(msg); events=()=>{
+     handlers.forEach(f=>f({type:'plan',algo:'full',phases:[]}));
+     handlers.forEach(f=>f({type:'standings',order:['def67890','abc12345']}));
+     handlers.forEach(f=>f({type:'done',order:['def67890','abc12345'],importance:{def67890:1,abc12345:0},matches:1,ms:150,jev:{errors:0,decisions:3,p50:50}}));
+   };
+ }};}
+}};
+const tick=()=>new Promise(resolve=>setTimeout(resolve,0));
+const send=msg=>new Promise(resolve=>listeners[0](msg,{},resolve));
+window.addEventListener('load',async()=>{
+ const results=[];const check=(ok,label)=>{if(!ok)throw Error(label);results.push('PASS: '+label);};
+ try{
+  check(!!document.querySelector('.jevx-sort'),'existing Sort button is retained');
+  check((await send({type:'glancePresence'})).gmail,'only a focused Gmail document reports active');
+  holdMeta=true;const loading=send({type:'glanceLookup',id:'loading-command',mode:'screen'});await tick();
+  await send({type:'glanceCancel',id:'loading-command'});check((await loading).error.includes('cancelled'),'a shortcut can cancel while inbox metadata is loading');
+  releaseMeta();holdMeta=false;await tick();
+  check(!calls.some(c=>c.type==='analyze'),'late inbox metadata cannot start a cancelled tournament');
+  const pending=send({type:'glanceLookup',mode:'screen',criterion:'deadline first'});await tick();
+  check(calls.find(c=>c.type==='analyze')?.q==='deadline first','native K uses the existing analyze port and criterion');
+  check((await send({type:'glanceLookup',mode:'screen'})).error.includes('already running'),'concurrent shortcut cannot start a duplicate sort');
+  events();const result=await pending;
+  check(result.threadID==='def67890','K returns the top thread from the original tournament');
+  check(document.querySelector('tr.zA [data-legacy-thread-id]').dataset.legacyThreadId==='def67890','the original row reorder is preserved');
+  const row=document.querySelector('[data-legacy-thread-id="abc12345"]');const rect=row.getBoundingClientRect();
+  document.dispatchEvent(new MouseEvent('mousemove',{clientX:rect.x+5,clientY:rect.y+5,bubbles:true}));
+  check((await send({type:'glanceLookup',mode:'cursor'})).threadID==='abc12345','L selects the hovered row using its Gmail API thread id');
+  document.dispatchEvent(new MouseEvent('mouseleave'));location.hash='#inbox/def67890';
+  document.querySelector('table').style.display='none';
+  const message=document.createElement('div');message.dataset.legacyThreadId='def67890';message.textContent='Open conversation';document.querySelector('[role=main]').appendChild(message);
+  check((await send({type:'glanceLookup',mode:'cursor'})).threadID==='def67890','L ignores hidden inbox rows and selects the open conversation');
+  message.remove();location.hash='#inbox';
+  check(!!(await send({type:'glanceLookup',mode:'cursor'})).error,'L refuses an ambiguous inbox area');
+  document.querySelector('table').style.display='';
+  const again=send({type:'glanceLookup',mode:'screen'});await tick();document.querySelector('.jevx-x').click();events();
+  check((await again).threadID==='def67890','closing the panel does not strand the native K response');
+  const cancellable = send({type:'glanceLookup',id:'command-1',mode:'screen'});await tick();const lateEvents=events, beforeCancel=disconnects;
+  await send({type:'glanceCancel',id:'another-command'});
+  check(disconnects===beforeCancel,'an unrelated cancel cannot stop the current shortcut');
+  await send({type:'glanceCancel',id:'command-1'});
+  check((await cancellable).error.includes('cancelled') && disconnects>beforeCancel,'native cancellation disconnects the existing Sort port and resolves its reply');
+  const newer=send({type:'glanceLookup',id:'command-2',mode:'screen'});await tick();const currentEvents=events;
+  lateEvents();
+  check(document.querySelector('.jevx-sort').textContent.includes('Sorting'),'late cancelled tournament events cannot complete a newer sort');
+  currentEvents();check((await newer).threadID==='def67890','a new shortcut can run after cancellation');
+  const escape = send({type:'glanceLookup',id:'command-3',mode:'screen'});await tick();
+  document.dispatchEvent(new KeyboardEvent('keydown',{code:'Escape',key:'Escape',bubbles:true}));
+  check((await escape).error.includes('cancelled'),'Escape cancels a native-triggered sort immediately');
+  document.querySelector('#results').textContent=results.join('\n')+'\n\n'+results.length+' browser checks passed.';
+ }catch(error){document.querySelector('#results').textContent=results.join('\n')+'\nFAIL: '+error.message;}
+});
+</script><script src="/extension/content.js"></script>

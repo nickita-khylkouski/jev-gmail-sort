@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Jev Sort for Gmail",
-  "version": "0.1.0",
-  "description": "Sort your last 24 hours of Gmail by any sentence. Jev ranks every email in about two seconds; nothing in your account is changed.",
+  "version": "0.3.0",
+  "description": "Sort Gmail with Jev, connect Glance for K/L screen context, or press F8 to correct spelling in your active draft.",
   "permissions": ["storage"],
   "host_permissions": ["http://localhost:8383/*"],
   "background": { "service_worker": "background.js" },
-  "content_scripts": [{ "matches": ["https://mail.google.com/*"], "js": ["content.js"], "css": ["content.css"], "run_at": "document_idle" }],
+  "content_scripts": [{ "matches": ["https://mail.google.com/*"], "js": ["content.js", "spellcheck.js"], "css": ["content.css", "spellcheck.css"], "run_at": "document_idle" }],
   "icons": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" }
 }

@@ -1,1 +1,15 @@
-{ "name": "jev-gmail-rank", "private": true, "type": "module", "scripts": { "start": "bun run server.ts" } }
+{
+  "name": "jev-gmail-rank",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run server.ts",
+    "test": "bun test",
+    "companion:build": "zsh scripts/build-companion.sh",
+    "companion:pair": "bun run scripts/pair-companion.ts"
+  },
+  "dependencies": {
+    "dictionary-en": "^4.0.0",
+    "nspell": "^2.1.5"
+  }
+}
