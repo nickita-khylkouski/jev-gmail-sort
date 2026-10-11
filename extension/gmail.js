@@ -8,8 +8,13 @@ const GM = "https://gmail.googleapis.com/gmail/v1/users/me";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let token = null;
+let refreshing = null;
 async function accessToken() {
   if (token && token.exp > Date.now() + 60e3) return token.value;
+  // Prefetch and sort can both be waiting on the same expired token.
+  return (refreshing ||= refreshToken().finally(() => { refreshing = null; }));
+}
+async function refreshToken() {
   const g = secrets.google;
   const res = await fetch(g.token_uri, {
     method: "POST",
@@ -23,9 +28,17 @@ async function accessToken() {
 }
 
 async function get(path) {
+  let refreshed = false;
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(GM + path, { headers: { Authorization: `Bearer ${await accessToken()}` } });
+    const value = await accessToken();
+    const res = await fetch(GM + path, { headers: { Authorization: `Bearer ${value}` } });
     if (res.ok) return res.json();
+    if (res.status === 401 && !refreshed) {
+      if (token?.value === value) token = null;
+      refreshed = true;
+      await res.body?.cancel();
+      continue;
+    }
     const text = await res.text();
     const quota = res.status === 429 || (res.status === 403 && /quota|rate ?limit/i.test(text));
     if (quota) nextAt = Math.max(nextAt, Date.now() + 1000); // back off new reads too, not just this one

@@ -4,9 +4,15 @@ const READONLY = "https://www.googleapis.com/auth/gmail.readonly";
 const GM = "https://gmail.googleapis.com/gmail/v1/users/me";
 
 let token: { value: string; exp: number } | null = null;
+let refreshing: Promise<string> | null = null;
 
 async function accessToken() {
   if (token && token.exp > Date.now() + 60e3) return token.value;
+  // Inbox reads start together. Share one refresh, and allow another attempt after a failure.
+  return (refreshing ||= refreshToken().finally(() => { refreshing = null; }));
+}
+
+async function refreshToken() {
   const cred = await Bun.file(process.env.GOOGLE_TOKEN_FILE!).json();
   const res = await fetch(cred.token_uri || "https://oauth2.googleapis.com/token", {
     method: "POST",
@@ -26,9 +32,18 @@ async function accessToken() {
 }
 
 async function get(path: string): Promise<any> {
+  let refreshed = false;
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(GM + path, { headers: { Authorization: `Bearer ${await accessToken()}` } });
+    const value = await accessToken();
+    const res = await fetch(GM + path, { headers: { Authorization: `Bearer ${value}` } });
     if (res.ok) return res.json();
+    if (res.status === 401 && !refreshed) {
+      // A late 401 for an older token must not invalidate a refresh another read just finished.
+      if (token?.value === value) token = null;
+      refreshed = true;
+      await res.body?.cancel();
+      continue;
+    }
     const text = await res.text();
     const quota = res.status === 429 || (res.status === 403 && /quota|rate ?limit/i.test(text));
     if ((quota || res.status >= 500) && attempt < 6) {
