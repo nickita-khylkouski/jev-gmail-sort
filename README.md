@@ -32,7 +32,9 @@ bun run scripts/secrets.ts   # writes extension/secrets.js (gitignored)
 bun run build                # src/rank.ts → extension/engine.js
 ```
 
-Then go to `chrome://extensions`, turn on Developer mode, choose **Load unpacked**, and pick `extension/`. Keys can also be entered in the extension's settings instead of `secrets.js`.
+For the any-page panel, leave `GOOGLE_TOKEN_FILE` unset (remove its example value from `.env`); Google credentials are only needed for full-thread Gmail reads. Still run `scripts/secrets.ts` to create the module the extension imports, even if you will enter your Jev and OpenAI keys in settings.
+
+Then go to `chrome://extensions`, turn on Developer mode, choose **Load unpacked**, and pick `extension/`. Jev and OpenAI keys can also be entered in the extension's settings.
 
 ## Safety
 
