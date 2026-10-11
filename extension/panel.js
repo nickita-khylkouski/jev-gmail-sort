@@ -1,6 +1,6 @@
 // Shortlist: sort any page by a sentence. The side panel reads the page's text, a fast model picks out
 // the items worth ranking (streamed in one by one), and pairwise judgments rank them while they arrive.
-// The page is read ahead as soon as the panel shows it, so pressing Sort usually goes straight to ranking.
+// The page is read ahead for its first starter sentence as soon as the panel shows it, so that one is instant.
 import { configure, rankLive } from "./engine.js";
 import secrets from "./secrets.js";
 
@@ -37,7 +37,7 @@ async function showTab() {
   $("#phost").textContent = t.url ? new URL(t.url).hostname.replace(/^www\./, "") : "";
   if (t.favIconUrl) $("#fav").src = t.favIconUrl;
   else $("#fav").removeAttribute("src");
-  const ideas = IDEAS.find(([re]) => re.test(t.url || ""))[1];
+  const ideas = ideasFor(t.url);
   $("#ideas").innerHTML = ideas.map((q) => `<button type="button">${esc(q)}</button>`).join("");
   $("#list").innerHTML = "";
   $("#status").hidden = true;
@@ -91,9 +91,10 @@ async function readPage(t) {
 }
 
 // ---------- 2. pick out the items (streamed as JSON lines) ----------
-// The sentence isn't part of this step, so one read of a page serves every sentence and can start
-// before anything is typed.
-const PROMPT = `You pick out the items on a web page that someone wants to rank (they'll say by what later).
+// The sentence decides what the items are: "most useful" on a profile is its accomplishments,
+// "most useful person" is the people on it. So every sentence gets its own read of the page.
+const PROMPT = (q) => `You pick out the items on a web page that someone wants to rank. They will rank them by: "${q}".
+If the sentence names what to rank ("most useful person", "best repo", "cheapest flight"), pick out exactly those. Otherwise the sentence only says how to rank, and the items are the page's main content, as below.
 The page text is given as numbered lines. Point at the items by line number; don't copy their text.
 Output JSON Lines only: one JSON object per line, no prose, no code fences.
 First line: {"noun": "<singular noun for one item, e.g. comment, finding, achievement, product>"}
@@ -108,7 +109,7 @@ Be exhaustive: every item of that kind, at most ${MAX_ITEMS}. Skip navigation, a
 const PART = 160; // lines per part
 const OVERLAP = 12; // lines shared by neighbouring parts, so an item on a boundary is seen whole
 
-async function extract(page, onItem, onNoun) {
+async function extract(page, q, onItem, onNoun) {
   const { openai = "" } = await chrome.storage.local.get("openai");
   const key = openai || secrets.openaiKey;
   if (!key) throw new Error("Add an OpenAI key in the settings to read pages.");
@@ -118,7 +119,7 @@ async function extract(page, onItem, onNoun) {
   const claimed = new Set(); // first lines of items already taken (parts overlap)
   const nouns = await Promise.all(
     Array.from({ length: parts }, (_, k) =>
-      extractPart(key, page, k * size, Math.min(n, (k + 1) * size + OVERLAP), k, parts, onNoun, (it) => {
+      extractPart(key, page, q, k * size, Math.min(n, (k + 1) * size + OVERLAP), k, parts, onNoun, (it) => {
         if (claimed.has(it.from)) return;
         claimed.add(it.from);
         onItem(it);
@@ -128,7 +129,7 @@ async function extract(page, onItem, onNoun) {
   return nouns.find((x) => x !== "item") || "item";
 }
 
-async function extractPart(key, page, from, to, k, parts, onNoun, onItem) {
+async function extractPart(key, page, q, from, to, k, parts, onNoun, onItem) {
   const where = parts > 1 ? `This is part ${k + 1} of ${parts} of the page (lines ${from + 1}-${to}); list the items in this part.\n` : "";
   const ask = (model) =>
     fetch("https://api.openai.com/v1/chat/completions", {
@@ -140,7 +141,7 @@ async function extractPart(key, page, from, to, k, parts, onNoun, onItem) {
         reasoning_effort: "none",
         max_completion_tokens: 6000,
         messages: [
-          { role: "system", content: PROMPT },
+          { role: "system", content: PROMPT(q) },
           { role: "user", content: `Page: ${page.title}\nURL: ${page.url}\n${where}\n${page.lines.slice(from, to).map((l, i) => `${from + i + 1}| ${l}`).join("\n")}` },
         ],
       }),
@@ -186,16 +187,25 @@ async function extractPart(key, page, from, to, k, parts, onNoun, onItem) {
   return noun;
 }
 
-// One extraction per page, shared by the read-ahead and every sort on it. Not on Gmail: its own Sort
+// Read-aheads: one extraction per page, for its first starter sentence. A Sort by that sentence uses
+// it (once); any other Sort, or the same one again, reads the page fresh. Not on Gmail: its own Sort
 // button covers the inbox, and mail shouldn't leave the browser without a click.
-const jobs = new Map(); // url -> { items, noun, subs, done, tEnd }
+const jobs = new Map(); // url -> { q, items, noun, subs, done, tEnd }
+const ideasFor = (url) => IDEAS.find(([re]) => re.test(url || ""))[1];
 function readAhead(t) {
-  if (/^https?:/.test(t.url || "") && !/mail\.google\.com/.test(t.url)) job(t).done.catch(() => {});
+  if (!/^https?:/.test(t.url || "") || /mail\.google\.com/.test(t.url) || jobs.has(t.url)) return;
+  const j = job(t, ideasFor(t.url)[0]);
+  jobs.set(t.url, j);
+  j.done.catch(() => jobs.get(t.url) === j && jobs.delete(t.url)); // retried on the next visit
+  for (const u of [...jobs.keys()].slice(0, -12)) jobs.delete(u);
 }
-function job(t) {
-  let j = jobs.get(t.url);
-  if (j) return j;
-  j = { items: [], noun: "item", subs: new Set(), tEnd: 0 };
+function take(t, q) {
+  const j = jobs.get(t.url);
+  if (j?.q === q) return jobs.delete(t.url), j;
+  return job(t, q);
+}
+function job(t, q) {
+  const j = { q, items: [], noun: "item", subs: new Set(), tEnd: 0 };
   const me = j;
   j.done = (async () => {
     const page = await readPage(t).catch(() => {
@@ -204,6 +214,7 @@ function job(t) {
     me.page = page;
     const noun = await extract(
       page,
+      q,
       (it) => {
         if (me.items.length >= MAX_ITEMS) return;
         me.items.push(it);
@@ -214,9 +225,6 @@ function job(t) {
     if (me.noun === "item") me.noun = noun;
     me.tEnd = performance.now();
   })();
-  j.done.catch(() => jobs.get(t.url) === me && jobs.delete(t.url)); // a failed read is retried on Sort
-  jobs.set(t.url, j);
-  for (const u of [...jobs.keys()].slice(0, -12)) jobs.delete(u);
   return j;
 }
 
@@ -293,9 +301,9 @@ async function sort(q) {
   const t0 = performance.now();
   const ids = new Map(); // item -> id
   let ranker = null, decided = 0, budget = 1;
-  const plural = () => `${ids.size} ${j.noun}${ids.size === 1 || j.noun.endsWith("s") ? "" : "s"}`;
+  const plural = () => `${ids.size} ${ids.size === 1 || j.noun.endsWith("s") ? j.noun : j.noun.replace(/([^aeiou])y$/, "$1ie") + "s"}`;
   const elapsed = () => ((performance.now() - t0) / 1000).toFixed(1);
-  const j = job(tab);
+  const j = take(tab, q);
   const ahead = !!j.tEnd;
   const tick = setInterval(() => {
     if (!live()) return;

@@ -14,11 +14,11 @@ A Chrome extension that ranks whatever you're looking at by a sentence you type,
 | Gmail inbox | what matters most to me | 50 emails, pre-sorted in the background, so the click is instant |
 | A LinkedIn profile | most impressive achievement, on merit | About 20 achievements pulled from the profile: 0.9s after Sort |
 
-Times are with the page already read ahead (the panel was open before you typed). Starting cold adds the page read, about 3s for a short page and 6–8s for a long thread, because ranking runs during it.
+Times are with the page already read ahead for that sentence (the panel was open before you picked it). Starting cold adds the page read, about 3s for a short page and 6–8s for a long thread, because ranking runs during it.
 
 ## How the ranking works
 
-1. **Read ahead** (side panel only). When the panel shows a page, its text is split into numbered lines and long pages into parts. The model reads the parts in parallel and streams back one JSON line per item, pointing at the item's lines instead of copying them, so the text shown is the page's own. It skips navigation, ads and "people also viewed". This step doesn't depend on the sentence, so one read serves every sort of that page.
+1. **Read ahead** (side panel only). When the panel shows a page, its text is split into numbered lines and long pages into parts. The model reads the parts in parallel and streams back one JSON line per item, pointing at the item's lines instead of copying them, so the text shown is the page's own. It skips navigation, ads and "people also viewed". The sentence decides what the items are ("most useful" on a profile ranks accomplishments, "most useful person" ranks people), so every Sort reads the page fresh. The read-ahead covers the page's first starter sentence.
 2. **Rank while items arrive.** Ranking starts with the second item; there are no rounds. Whenever an item is free, it plays the opponent the current Bradley–Terry fit is least sure about, maximizing p(1−p)·(1/gₐ + 1/g_b). A new item starts mid-scale, so its first games place it the way a binary search would. Each game is one question: "which ranks higher by this sentence?". A and B are swapped at random so position bias averages out, and every answer is a probability (a soft win). Each item plays about ⌈log₂ n⌉ + 2 games, at most two at a time. When the last item is in, the top 6 also play any neighbour they haven't met.
 3. **Bradley–Terry fit** over all the games gives the order, re-fit every 250ms while it runs.
 
